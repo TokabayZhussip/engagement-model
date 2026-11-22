@@ -28,7 +28,7 @@ clustering:
   silhouette_sample: 10000
 
 hmm:
-  n_states_range: [2, 3, 4, 5]
+  n_states_range: [4]
   max_sequences: 5000              # сколько студентов брать для обучения HMM
   n_iter: 100
 
