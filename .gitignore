@@ -5,6 +5,9 @@ data/processed/*
 !data/processed/.gitkeep
 outputs/*
 !outputs/.gitkeep
+# результаты для статьи хранятся в репозитории (кроме большой панели индекса)
+!outputs/hmm4/
+outputs/hmm4/engagement_index.*
 
 # Python
 __pycache__/
