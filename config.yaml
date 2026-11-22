@@ -1,0 +1,49 @@
+# Конфигурация эксперимента для статьи
+# «Многомерная модель оценки вовлечённости обучающихся по данным цифрового следа»
+
+random_state: 42
+
+data:
+  raw_dir: data/raw/oulad          # сюда распаковать CSV-файлы OULAD
+  processed_dir: data/processed
+output_dir: outputs
+
+panel:
+  max_week: 38                     # максимум недель курса (курсы OULAD ~ 33–38 недель)
+
+features:
+  activity_types: [homepage, oucontent, forumng, quiz, resource, subpage, url, ouwiki]
+
+index:
+  normalization: rank              # rank (процентиль внутри курса-недели) | minmax
+  weighting: entropy               # entropy | pca | equal
+  ema_alpha: 0.5                   # сглаживание E(t) = a*E_raw(t) + (1-a)*E(t-1)
+  emotional_weight: 0.0            # >0, если подключён эмоциональный компонент (колонка emotion_score)
+
+clustering:
+  weeks: 20                        # длина траектории E(t) для кластеризации
+  k_range: [2, 3, 4, 5, 6]
+  silhouette_sample: 10000
+
+hmm:
+  n_states_range: [2, 3, 4, 5]
+  max_sequences: 5000              # сколько студентов брать для обучения HMM
+  n_iter: 100
+
+prediction:
+  test_presentations: [2014J]      # временное разбиение: тест — самый поздний поток
+  horizon: 2                       # h: смотрим падение на h недель вперёд
+  history: 3                       # окно истории для базового уровня вовлечённости
+  drop_ratio: 0.5                  # падение = средняя E в будущем < 0.5 * средняя E в прошлом
+  min_history_engagement: 0.2      # прогнозируем падение только у тех, кто был вовлечён
+  eval_weeks: [2, 4, 6, 8, 10, 12, 15, 20]
+  early_warning_target_auc: 0.80
+  val_fraction: 0.1
+  lstm:
+    enabled: true
+    window: 8
+    hidden: 64
+    epochs: 15
+    batch_size: 512
+    lr: 0.001
+    patience: 3
