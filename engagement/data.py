@@ -49,8 +49,11 @@ def load_oulad(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
             dtype=_DTYPES.get(name),
         )
 
-    # единые категориальные типы для ключей курса
+    # ключи курса — строки во всех таблицах, кроме studentVle (~10 млн строк),
+    # где они остаются категориальными для экономии памяти
     for name, df in d.items():
+        if name == "student_vle":
+            continue
         for col in COURSE:
             if col in df.columns:
                 df[col] = df[col].astype(str)
