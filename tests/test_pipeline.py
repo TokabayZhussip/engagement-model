@@ -5,7 +5,7 @@ from engagement.data import load_oulad
 from engagement.features import BEHAVIORAL, COGNITIVE, build_weekly_features
 from engagement.index import build_engagement_index, cronbach_alpha, entropy_weights, validate_index
 from engagement.predict import fit_tabular_models, make_drop_dataset, split_by_presentation
-from engagement.states import cluster_trajectories, fit_hmm, trajectory_matrix
+from engagement.states import cluster_trajectories, describe_clusters, fit_hmm, trajectory_matrix
 from scripts.make_synthetic_oulad import generate
 
 
@@ -64,15 +64,33 @@ def test_states(index):
     mat = trajectory_matrix(idx, 15)
     cl = cluster_trajectories(mat, [2, 3], 1000, 0)
     assert cl["labels"].nunique() == cl["best_k"]
-    h = fit_hmm(idx, [2, 3], 200, 20, 0)
+    h = fit_hmm(idx, [2, 3], 200, 20, 0, train_mask=idx["code_presentation"] != "2014J")
     assert np.allclose(h["transmat"].sum(axis=1), 1)
     assert len(h["states"]) == len(idx)
+    f = h["filtered"]
+    pcols = [c for c in f.columns if c.startswith("hmm_p")]
+    assert np.allclose(f[pcols].sum(axis=1), 1)
+    assert len(f) == len(idx)
 
 
-def test_prediction(index):
+def test_cluster_k_final(index):
     _, idx, _ = index
-    ds = make_drop_dataset(idx, 2, 3, 0.5, 0.2)
+    mat = trajectory_matrix(idx, 15)
+    cl = cluster_trajectories(mat, [2, 3, 4], 1000, 0, k_final=3)
+    assert cl["best_k"] == 3 and cl["labels"].nunique() == 3
+    desc = describe_clusters(cl["centers"])
+    assert len(desc) == 3 and desc["type"].notna().all()
+
+
+@pytest.mark.parametrize("label", ["hmm", "ratio"])
+def test_prediction(index, label):
+    _, idx, _ = index
+    h = fit_hmm(idx, [3], 200, 20, 0)
+    idx = idx.join(h["filtered"])
+    ds = make_drop_dataset(idx, 2, 3, 0.5, 0.2, label)
     assert set(ds["y"].unique()) <= {0, 1}
+    if label == "hmm":
+        assert (ds["hmm_fstate"] >= 1).all()
     tr, va, te = split_by_presentation(ds, ["2014J"], 0.1, 0)
     assert not (tr & te).any() and not (va & te).any()
     res = fit_tabular_models(ds, tr, va, te, 0)

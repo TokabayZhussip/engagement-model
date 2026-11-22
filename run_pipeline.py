@@ -22,9 +22,12 @@ from engagement.data import load_oulad
 from engagement.features import build_weekly_features
 from engagement.index import build_engagement_index, validate_index
 from engagement.predict import (
-    auc_by_week, early_warning, fit_lstm, fit_tabular_models, make_drop_dataset, split_by_presentation,
+    auc_by_week, best_f1_threshold, early_warning, evaluate, fit_lstm, fit_tabular_models, make_drop_dataset,
+    markov_baseline, split_by_presentation,
 )
-from engagement.states import cluster_profiles, cluster_trajectories, fit_hmm, trajectory_matrix
+from engagement.states import (
+    cluster_profiles, cluster_trajectories, describe_clusters, fit_hmm, trajectory_matrix,
+)
 
 
 def log(msg: str, t0: float):
@@ -96,14 +99,17 @@ def main():
     # 3. Кластеры траекторий и HMM
     cc, hc = cfg["clustering"], cfg["hmm"]
     mat = trajectory_matrix(idx, cc["weeks"])
-    cl = cluster_trajectories(mat, cc["k_range"], cc["silhouette_sample"], seed)
-    profiles = cluster_profiles(cl["labels"], d["student_info"])
+    cl = cluster_trajectories(mat, cc["k_range"], cc["silhouette_sample"], seed,
+                              cc.get("k_final"), cc.get("bic_tol", 0.02))
+    desc = describe_clusters(cl["centers"])
+    profiles = cluster_profiles(cl["labels"], d["student_info"], desc)
     cl["selection"].to_csv(out / "clusters_selection.csv", index=False)
     profiles.to_csv(out / "clusters_profiles.csv")
-    log(f"k-means: лучшее k = {cl['best_k']}", t0)
+    log(f"кластеры: k по силуэту = {cl['k_silhouette']}, по BIC = {cl['k_bic']}, итоговое k = {cl['best_k']}", t0)
 
-    hmm = fit_hmm(idx, hc["n_states_range"], hc["max_sequences"], hc["n_iter"], seed)
+    hmm = fit_hmm(idx, hc["n_states_range"], hc["max_sequences"], hc["n_iter"], seed, train_mask)
     idx["hmm_state"] = hmm["states"]
+    idx = idx.join(hmm["filtered"])
     hmm["selection"].to_csv(out / "hmm_selection.csv", index=False)
     hmm["transmat"].to_csv(out / "hmm_transmat.csv")
     hmm["means"].to_csv(out / "hmm_state_means.csv")
@@ -113,11 +119,33 @@ def main():
         idx.to_csv(out / "engagement_index.csv.gz", index=False)
 
     # 4. Прогноз падения вовлечённости
-    ds = make_drop_dataset(idx, pc["horizon"], pc["history"], pc["drop_ratio"], pc["min_history_engagement"])
+    label = pc.get("label", "hmm")
+    ds = make_drop_dataset(idx, pc["horizon"], pc["history"], pc["drop_ratio"],
+                           pc["min_history_engagement"], label)
     tr, va, te = split_by_presentation(ds, pc["test_presentations"], pc["val_fraction"], seed)
-    log(f"задача A: {len(ds):,} строк, доля y=1 {ds['y'].mean():.3f}; train/val/test = {tr.sum()}/{va.sum()}/{te.sum()}", t0)
+    log(f"задача A (метка {label}): {len(ds):,} строк, доля y=1 {ds['y'].mean():.3f} "
+        f"(из них отчисления {ds['y_withdraw'].mean():.3f}); train/val/test = {tr.sum()}/{va.sum()}/{te.sum()}", t0)
+
+    # сравнение определений метки (таблица для статьи)
+    label_cmp = []
+    for lb in ("hmm", "ratio"):
+        d2 = ds if lb == label else make_drop_dataset(idx, pc["horizon"], pc["history"], pc["drop_ratio"],
+                                                     pc["min_history_engagement"], lb)
+        t2, v2, e2 = (tr, va, te) if lb == label else split_by_presentation(
+            d2, pc["test_presentations"], pc["val_fraction"], seed)
+        m2 = fit_tabular_models(d2, t2, v2, e2, seed)["gbm"]["metrics"]
+        label_cmp.append({"label": lb, "n_rows": len(d2), "positive_rate": d2["y"].mean(),
+                          "withdraw_share_of_positives": d2["y_withdraw"].sum() / max(d2["y"].sum(), 1),
+                          "gbm_roc_auc": m2["roc_auc"], "gbm_pr_auc": m2["pr_auc"],
+                          "pr_auc_lift": m2["pr_auc"] / max(m2["positive_rate"], 1e-9)})
+    pd.DataFrame(label_cmp).to_csv(out / "label_comparison.csv", index=False)
 
     results = fit_tabular_models(ds, tr, va, te, seed)
+    if label == "hmm":
+        p_mk = markov_baseline(ds, hmm["transmat"].to_numpy(), pc["horizon"])
+        thr = best_f1_threshold(ds.loc[va, "y"].to_numpy(), p_mk[va])
+        results = {"markov": {"metrics": evaluate(ds.loc[te, "y"].to_numpy(), p_mk[te], thr), "p_test": p_mk[te]},
+                   **results}
     test_df = ds[te].reset_index(drop=True)
     metrics_a = {k: v["metrics"] for k, v in results.items()}
     curves_a = {k: auc_by_week(test_df, v["p_test"], pc["eval_weeks"]) for k, v in results.items()}
@@ -150,8 +178,11 @@ def main():
         "panel_shape": list(panel.shape),
         "index_weights": weights,
         "index_validity": validity,
-        "clusters": {"best_k": cl["best_k"]},
+        "clusters": {"k_used": cl["best_k"], "k_silhouette": cl["k_silhouette"], "k_bic": cl["k_bic"]},
         "hmm": {"best_n_states": hmm["best_n"], "transmat": hmm["transmat"].round(4).values.tolist()},
+        "drop_label": label,
+        "drop_positive_rate": float(ds["y"].mean()),
+        "label_comparison": label_cmp,
         "drop_prediction": metrics_a,
         "drop_auc_by_week": curves_a,
         "early_warning": ew,
@@ -194,17 +225,33 @@ def write_report(out: Path, m: dict, profiles: pd.DataFrame):
         "",
         "## 2. Типы траекторий и скрытые состояния",
         "",
-        f"Лучшее число кластеров k-means (по силуэту): {m['clusters']['best_k']}.",
+        f"Число кластеров: по силуэту = {m['clusters']['k_silhouette']}, по «локтю» BIC (GMM) = "
+        f"{m['clusters']['k_bic']}, использовано k = **{m['clusters']['k_used']}**. "
+        "Названия типов — автоматическая эвристика, сверьте с рис. 2.",
         "",
         profiles.to_markdown() if _has_tabulate() else profiles.to_string(),
         "",
-        f"HMM: число состояний по BIC = {m['hmm']['best_n_states']}, матрица переходов — `hmm_transmat.csv`.",
+        f"HMM: число состояний по BIC = {m['hmm']['best_n_states']} (0 — самая низкая вовлечённость).",
         "",
-        "## 3. Прогноз падения вовлечённости (тестовый поток)",
+        "Матрица переходов:",
         "",
-        "| Модель | ROC-AUC | PR-AUC | F1 |",
-        "|---|---|---|---|",
-        *[f"| {k} | {x['roc_auc']:.3f} | {x['pr_auc']:.3f} | {x['f1']:.3f} |" for k, x in m["drop_prediction"].items()],
+        _md_matrix(m["hmm"]["transmat"]),
+        "",
+        f"## 3. Прогноз падения вовлечённости (тестовый поток, метка: {m['drop_label']})",
+        "",
+        f"Доля положительного класса: {m['drop_positive_rate']:.3f}.",
+        "",
+        "| Модель | ROC-AUC | PR-AUC | Lift PR-AUC | F1 |",
+        "|---|---|---|---|---|",
+        *[f"| {k} | {x['roc_auc']:.3f} | {x['pr_auc']:.3f} | {x['pr_auc'] / x['positive_rate']:.1f}× | {x['f1']:.3f} |"
+          for k, x in m["drop_prediction"].items()],
+        "",
+        "Сравнение определений метки (GBM):",
+        "",
+        "| Метка | Строк | Доля y=1 | Доля отчислений среди y=1 | ROC-AUC | PR-AUC | Lift |",
+        "|---|---|---|---|---|---|---|",
+        *[f"| {r['label']} | {r['n_rows']:,} | {r['positive_rate']:.3f} | {r['withdraw_share_of_positives']:.2f} | "
+          f"{r['gbm_roc_auc']:.3f} | {r['gbm_pr_auc']:.3f} | {r['pr_auc_lift']:.1f}× |" for r in m["label_comparison"]],
         "",
         "## 4. Раннее предупреждение",
         "",
@@ -217,6 +264,14 @@ def write_report(out: Path, m: dict, profiles: pd.DataFrame):
         "",
     ]
     (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _md_matrix(rows) -> str:
+    k = len(rows)
+    head = "| t \\ t+1 | " + " | ".join(str(j) for j in range(k)) + " |"
+    sep = "|---" * (k + 1) + "|"
+    body = [f"| {i} | " + " | ".join(f"{v:.3f}" for v in r) + " |" for i, r in enumerate(rows)]
+    return "\n".join([head, sep, *body])
 
 
 def _has_tabulate() -> bool:

@@ -34,7 +34,14 @@ def indicator_columns(df: pd.DataFrame) -> list[str]:
 # ---------------------------------------------------------------- задача A
 
 def make_drop_dataset(idx: pd.DataFrame, horizon: int, history: int, drop_ratio: float,
-                      min_hist: float) -> pd.DataFrame:
+                      min_hist: float, label: str = "hmm") -> pd.DataFrame:
+    """Строит выборку для задачи A.
+
+    label="hmm"   (основной): студент сейчас НЕ в нижнем состоянии HMM (hmm_fstate ≥ 1),
+                  y = 1, если в ближайшие h недель он перейдёт в нижнее состояние 0
+                  или отчислится. Состояния — по прямому проходу (без заглядывания в будущее).
+    label="ratio" (прежний): y = 1, если F < drop_ratio · H или отчисление.
+    """
     df = idx.sort_values(KEY + ["week"]).reset_index(drop=True).copy()
     g = df.groupby(KEY, sort=False, observed=True)["E"]
 
@@ -48,16 +55,29 @@ def make_drop_dataset(idx: pd.DataFrame, horizon: int, history: int, drop_ratio:
 
     ww = df["withdraw_week"]
     y_w = (ww > df["week"]) & (ww <= df["week"] + horizon)
-    y_drop = df["F"] < drop_ratio * df["H"]
-    valid = (y_w | df["F"].notna()) & (df["H"] >= min_hist)
+
+    if label == "hmm":
+        if "hmm_fstate" not in df.columns:
+            raise ValueError("label='hmm' требует колонку hmm_fstate (запустите fit_hmm)")
+        gs = df.groupby(KEY, sort=False, observed=True)["hmm_fstate"]
+        fut_s = pd.concat([gs.shift(-k) for k in range(1, horizon + 1)], axis=1)
+        y_drop = (fut_s == 0).any(axis=1)
+        complete = fut_s.notna().all(axis=1)
+        valid = (y_w | complete) & (df["hmm_fstate"] >= 1)
+    elif label == "ratio":
+        y_drop = (df["F"] < drop_ratio * df["H"]).fillna(False)
+        valid = (y_w | df["F"].notna()) & (df["H"] >= min_hist)
+    else:
+        raise ValueError(f"Неизвестный тип метки: {label}")
 
     df["y_withdraw"] = y_w.astype(int)
-    df["y"] = (y_w | y_drop.fillna(False)).astype(int)
+    df["y"] = (y_w | y_drop).astype(int)
     return df[valid].reset_index(drop=True)
 
 
 def tabular_features(df: pd.DataFrame) -> list[str]:
-    return indicator_columns(df) + ["B", "C", "E", "E_lag1", "E_lag2", "dE", "H", "week"]
+    hmm = [c for c in df.columns if c.startswith("hmm_p")]
+    return indicator_columns(df) + ["B", "C", "E", "E_lag1", "E_lag2", "dE", "H", "week"] + hmm
 
 
 def split_by_presentation(df: pd.DataFrame, test_presentations: list[str], val_fraction: float, seed: int):
@@ -116,6 +136,20 @@ def fit_tabular_models(df, train, val, test, seed) -> dict:
     return res
 
 
+def markov_baseline(df: pd.DataFrame, transmat: np.ndarray, horizon: int) -> np.ndarray:
+    """Базовая модель: P(попасть в состояние 0 за h шагов) только по матрице переходов HMM.
+
+    Состояние 0 делается поглощающим; стартовое распределение — текущие
+    апостериорные вероятности hmm_p*. Отчисление этой моделью не учитывается отдельно.
+    """
+    t = np.array(transmat, dtype=float).copy()
+    t[0] = 0.0
+    t[0, 0] = 1.0
+    th = np.linalg.matrix_power(t, horizon)
+    p = df[[c for c in df.columns if c.startswith("hmm_p")]].to_numpy()
+    return (p @ th)[:, 0]
+
+
 # ---------------------------------------------------------------- LSTM
 
 def fit_lstm(idx: pd.DataFrame, df: pd.DataFrame, train, val, test, cfg: dict, seed: int) -> dict:
@@ -123,7 +157,7 @@ def fit_lstm(idx: pd.DataFrame, df: pd.DataFrame, train, val, test, cfg: dict, s
     from torch import nn
 
     torch.manual_seed(seed)
-    feats = indicator_columns(idx) + SEQ_FEATURES_EXTRA
+    feats = indicator_columns(idx) + SEQ_FEATURES_EXTRA + [c for c in idx.columns if c.startswith("hmm_p")]
     L = int(cfg["window"])
 
     idx = idx.sort_values(KEY + ["week"]).reset_index(drop=True)
