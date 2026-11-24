@@ -64,6 +64,8 @@ def make_drop_dataset(idx: pd.DataFrame, horizon: int, history: int, drop_ratio:
         y_drop = (fut_s == 0).any(axis=1)
         complete = fut_s.notna().all(axis=1)
         valid = (y_w | complete) & (df["hmm_fstate"] >= 1)
+        df["y_s0"] = y_drop.astype(int)          # компонента «переход в S0»
+        df["future_complete"] = complete.astype(int)
     elif label == "ratio":
         y_drop = (df["F"] < drop_ratio * df["H"]).fillna(False)
         valid = (y_w | df["F"].notna()) & (df["H"] >= min_hist)

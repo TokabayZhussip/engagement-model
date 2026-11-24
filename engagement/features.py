@@ -91,7 +91,10 @@ def _vle_features(d: dict[str, pd.DataFrame], activity_types: list[str]) -> pd.D
     return wk
 
 
-def _assessment_features(d: dict[str, pd.DataFrame], max_week: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _assessment_features(d: dict[str, pd.DataFrame], max_week: int,
+                         score_delay: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """score_delay — через сколько недель после сдачи балл считается известным платформе
+    (в OULAD дата публикации оценки отсутствует)."""
     ass = d["assessments"]
     sa = d["student_assessment"].merge(ass, on="id_assessment", how="inner")
     sa = sa[sa["assessment_type"] != "Exam"].copy()  # экзамен в конце, на прогноз не влияет
@@ -102,11 +105,14 @@ def _assessment_features(d: dict[str, pd.DataFrame], max_week: int) -> tuple[pd.
 
     per_week = sa.groupby(WK).agg(
         n_sub=("id_assessment", "count"),
-        sum_score=("score", "sum"),
-        n_scored=("scored", "sum"),
         sum_late=("late", "sum"),
         n_late=("late_n", "sum"),
     ).reset_index()
+    # баллы учитываются с недели сдачи + score_delay
+    sa["score_week"] = (sa["week"] + score_delay).clip(upper=max_week - 1)
+    scores = sa.groupby(KEY + ["score_week"]).agg(
+        sum_score=("score", "sum"), n_scored=("scored", "sum")).reset_index().rename(columns={"score_week": "week"})
+    per_week = per_week.merge(scores, on=WK, how="outer")
 
     due = ass[(ass["assessment_type"] != "Exam") & ass["date"].notna()].copy()
     due["week"] = (due["date"] // 7).astype(int)
@@ -114,7 +120,8 @@ def _assessment_features(d: dict[str, pd.DataFrame], max_week: int) -> tuple[pd.
     return per_week, due
 
 
-def build_weekly_features(d: dict[str, pd.DataFrame], max_week: int, activity_types: list[str]) -> pd.DataFrame:
+def build_weekly_features(d: dict[str, pd.DataFrame], max_week: int, activity_types: list[str],
+                          score_delay: int = 0) -> pd.DataFrame:
     panel = build_panel(d, max_week)
 
     vle = _vle_features(d, activity_types)
@@ -122,7 +129,7 @@ def build_weekly_features(d: dict[str, pd.DataFrame], max_week: int, activity_ty
     fill_cols = [c for c in vle.columns if c not in WK]
     panel[fill_cols] = panel[fill_cols].fillna(0.0)
 
-    per_week, due = _assessment_features(d, max_week)
+    per_week, due = _assessment_features(d, max_week, score_delay)
     panel = panel.merge(per_week, on=WK, how="left")
     acc = ["n_sub", "sum_score", "n_scored", "sum_late", "n_late"]
     panel[acc] = panel[acc].fillna(0.0)

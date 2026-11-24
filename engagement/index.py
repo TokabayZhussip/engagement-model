@@ -89,14 +89,16 @@ def build_engagement_index(
     ema_alpha: float = 0.5,
     emotional_weight: float = 0.0,
     weight_mask: pd.Series | None = None,
+    cognitive: dict | None = None,
+    behavioral: dict | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Добавляет к панели n_*-индикаторы, B, C, E_raw, E. Возвращает (панель, веса).
 
     weight_mask — строки, по которым оцениваются веса (обучающая выборка),
     чтобы веса не «видели» тестовый поток.
     """
-    nb = normalize(panel, BEHAVIORAL, normalization)
-    nc = normalize(panel, COGNITIVE, normalization)
+    nb = normalize(panel, behavioral or BEHAVIORAL, normalization)
+    nc = normalize(panel, cognitive or COGNITIVE, normalization)
     out = pd.concat([panel, nb, nc], axis=1)
 
     mask = np.ones(len(out), bool) if weight_mask is None else np.asarray(weight_mask, bool)
